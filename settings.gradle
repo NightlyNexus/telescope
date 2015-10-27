@@ -1,2 +1,3 @@
+rootProject.name = 'telescope-project'
 include ':telescope'
 include ':telescope-sample'

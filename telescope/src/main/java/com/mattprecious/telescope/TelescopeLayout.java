@@ -1,23 +1,35 @@
 package com.mattprecious.telescope;
 
 import android.animation.ValueAnimator;
+import android.annotation.TargetApi;
 import android.content.Context;
 import android.content.res.TypedArray;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Paint;
+import android.graphics.PixelFormat;
+import android.hardware.display.DisplayManager;
+import android.hardware.display.VirtualDisplay;
+import android.media.Image;
+import android.media.ImageReader;
+import android.media.projection.MediaProjection;
 import android.os.AsyncTask;
+import android.os.Build;
 import android.os.Handler;
 import android.os.Process;
 import android.os.Vibrator;
 import android.util.AttributeSet;
+import android.util.DisplayMetrics;
 import android.util.Log;
 import android.view.MotionEvent;
+import android.view.Surface;
 import android.view.View;
+import android.view.WindowManager;
 import android.widget.FrameLayout;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.text.SimpleDateFormat;
 import java.util.Date;
 
@@ -25,6 +37,7 @@ import static android.Manifest.permission.VIBRATE;
 import static android.animation.ValueAnimator.AnimatorUpdateListener;
 import static android.content.pm.PackageManager.PERMISSION_GRANTED;
 import static android.graphics.Paint.Style;
+import static android.os.Build.VERSION_CODES.LOLLIPOP;
 
 /**
  * A layout used to take a screenshot and initiate a callback when the user long-presses the
@@ -39,9 +52,6 @@ public class TelescopeLayout extends FrameLayout {
   private static final long DONE_DURATION_MS = 1000;
   private static final long TRIGGER_DURATION_MS = 1000;
   private static final long VIBRATION_DURATION_MS = 50;
-
-  private static final int DEFAULT_POINTER_COUNT = 2;
-  private static final int DEFAULT_PROGRESS_COLOR = 0xff33b5e5;
 
   private final Vibrator vibrator;
   private final Handler handler = new Handler();
@@ -65,6 +75,8 @@ public class TelescopeLayout extends FrameLayout {
   private boolean screenshotChildrenOnly;
   private boolean vibrate;
 
+  private OnMediaProjectionRequestedListener requestedListener;
+
   // State.
   private float progressFraction;
   private float doneFraction;
@@ -80,22 +92,23 @@ public class TelescopeLayout extends FrameLayout {
     this(context, attrs, 0);
   }
 
-  public TelescopeLayout(Context context, AttributeSet attrs, int defStyle) {
-    super(context, attrs, defStyle);
+  public TelescopeLayout(Context context, AttributeSet attrs, int defStyleAttr) {
+    super(context, attrs, defStyleAttr);
+    int defStyleRes = R.style.TelescopeLayoutDefault;
     setWillNotDraw(false);
     screenshotTarget = this;
 
     float density = context.getResources().getDisplayMetrics().density;
     halfStrokeWidth = PROGRESS_STROKE_DP * density / 2;
 
-    TypedArray a = context.obtainStyledAttributes(attrs, R.styleable.TelescopeLayout, defStyle, 0);
-    pointerCount = a.getInt(R.styleable.TelescopeLayout_pointerCount, DEFAULT_POINTER_COUNT);
-    int progressColor =
-        a.getColor(R.styleable.TelescopeLayout_progressColor, DEFAULT_PROGRESS_COLOR);
-    screenshot = a.getBoolean(R.styleable.TelescopeLayout_screenshot, true);
+    TypedArray a = context.getTheme()
+        .obtainStyledAttributes(attrs, R.styleable.TelescopeLayout, defStyleAttr, defStyleRes);
+    pointerCount = a.getInt(R.styleable.TelescopeLayout_pointerCount, -1);
+    int progressColor = a.getColor(R.styleable.TelescopeLayout_progressColor, -1);
+    screenshot = a.getBoolean(R.styleable.TelescopeLayout_screenshot, false);
     screenshotChildrenOnly =
         a.getBoolean(R.styleable.TelescopeLayout_screenshotChildrenOnly, false);
-    vibrate = a.getBoolean(R.styleable.TelescopeLayout_vibrate, true);
+    vibrate = a.getBoolean(R.styleable.TelescopeLayout_vibrate, false);
     a.recycle();
 
     progressPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -136,6 +149,7 @@ public class TelescopeLayout extends FrameLayout {
 
     vibrator = (Vibrator) context.getSystemService(Context.VIBRATOR_SERVICE);
     screenshotFolder = getScreenshotFolder(context);
+    requestedListener = null;
   }
 
   /**
@@ -166,15 +180,35 @@ public class TelescopeLayout extends FrameLayout {
     progressPaint.setColor(progressColor);
   }
 
+  public interface OnMediaProjectionRequestedListener {
+    void onMediaProjectionRequested(OnMediaProjectionAcquiredListener acquiredListener);
+
+    interface OnMediaProjectionAcquiredListener {
+      void onMediaProjectionAcquired(MediaProjection projection, long delay);
+    }
+  }
+
+  /**
+   * Calls {@code setScreenshot(screenshot, null)}.
+   */
+  public void setScreenshot(boolean screenshot) {
+    setScreenshot(screenshot, null);
+  }
+
   /**
    * <p>Set whether a screenshot will be taken when capturing. Default is true.</p>
    *
    * <p>
    * <i>Requires the {@link android.Manifest.permission#WRITE_EXTERNAL_STORAGE} permission.</i>
    * </p>
+   *
+   * @param requestedListener If non-null, used with native screenshots.
+   * Unused if {@code screenshot} is false.
    */
-  public void setScreenshot(boolean screenshot) {
+  public void setScreenshot(boolean screenshot,
+      OnMediaProjectionRequestedListener requestedListener) {
     this.screenshot = screenshot;
+    this.requestedListener = requestedListener;
   }
 
   /**
@@ -328,6 +362,17 @@ public class TelescopeLayout extends FrameLayout {
     handler.removeCallbacks(trigger);
   }
 
+  private void complete(Bitmap screenshot) {
+    if (lens != null) {
+      lens.onCapture(screenshot, new BitmapProcessorListener() {
+        @Override public void onBitmapReady(Bitmap screenshot) {
+          capturing = false;
+          new SaveScreenshotTask(screenshot).execute();
+        }
+      });
+    }
+  }
+
   private void trigger() {
     stop();
 
@@ -345,23 +390,97 @@ public class TelescopeLayout extends FrameLayout {
       // Wait for the next frame to be sure our progress bars are hidden.
       post(new Runnable() {
         @Override public void run() {
-          View view = getTargetView();
-          view.setDrawingCacheEnabled(true);
-          Bitmap screenshot = Bitmap.createBitmap(view.getDrawingCache());
-          if (lens != null) {
-            lens.onCapture(screenshot, new BitmapProcessorListener() {
-              @Override
-              public void onBitmapReady(Bitmap screenshot) {
-                capturing = false;
-                new SaveScreenshotTask(screenshot).execute();
-              }
-            });
-          }
-          view.setDrawingCacheEnabled(false);
+          ScreenshotSaver screenshotSaver =
+              requestedListener != null && sdkLevelAllowsNativeScreenshots()
+                  ? new NativeScreenshotSaver() : new ViewDrawingCacheScreenshotSaver();
+          screenshotSaver.saveScreenshot();
         }
       });
     } else {
       new SaveScreenshotTask(null).execute();
+    }
+  }
+
+  private interface ScreenshotSaver {
+    void saveScreenshot();
+  }
+
+  private final class ViewDrawingCacheScreenshotSaver implements ScreenshotSaver {
+    @Override public void saveScreenshot() {
+      View view = getTargetView();
+      view.setDrawingCacheEnabled(true);
+      Bitmap screenshot = Bitmap.createBitmap(view.getDrawingCache());
+      view.setDrawingCacheEnabled(false);
+      complete(screenshot);
+    }
+  }
+
+  @TargetApi(LOLLIPOP) private final class NativeScreenshotSaver implements ScreenshotSaver {
+    @Override public void saveScreenshot() {
+      requestedListener.onMediaProjectionRequested(
+          new OnMediaProjectionRequestedListener.OnMediaProjectionAcquiredListener() {
+            @Override
+            public void onMediaProjectionAcquired(final MediaProjection projection, long delay) {
+              if (projection == null) {
+                new ViewDrawingCacheScreenshotSaver().saveScreenshot();
+                return;
+              }
+              if (delay == 0) {
+                saveScreenshot(projection);
+                return;
+              }
+              postDelayed(new Runnable() {
+                @Override public void run() {
+                  saveScreenshot(projection);
+                }
+              }, delay);
+            }
+
+            private void saveScreenshot(final MediaProjection projection) {
+              DisplayMetrics displayMetrics = new DisplayMetrics();
+              WindowManager windowManager =
+                  ((WindowManager) getContext().getSystemService(Context.WINDOW_SERVICE));
+              windowManager.getDefaultDisplay().getRealMetrics(displayMetrics);
+              final int width = displayMetrics.widthPixels;
+              final int height = displayMetrics.heightPixels;
+              final ImageReader imageReader =
+                  ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 1);
+              Surface surface = imageReader.getSurface();
+              final VirtualDisplay display =
+                  projection.createVirtualDisplay("telescope", width, height,
+                      displayMetrics.densityDpi, DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION,
+                      surface, null, null);
+              imageReader.setOnImageAvailableListener(new ImageReader.OnImageAvailableListener() {
+                @Override public void onImageAvailable(ImageReader reader) {
+                  Image image = reader.acquireLatestImage();
+                  if (image == null) {
+                    // No image data is available. Give up.
+                    capturing = false;
+                    return;
+                  }
+                  Image.Plane[] planes = image.getPlanes();
+                  ByteBuffer buffer = planes[0].getBuffer();
+                  int pixelStride = planes[0].getPixelStride();
+                  int rowStride = planes[0].getRowStride();
+                  int rowPadding = rowStride - pixelStride * width;
+                  image.close();
+                  Bitmap bitmap = Bitmap.createBitmap(width + rowPadding / pixelStride, height,
+                      Bitmap.Config.ARGB_8888);
+                  bitmap.copyPixelsFromBuffer(buffer);
+                  // Trim the screenshot to the correct size.
+                  Bitmap croppedBitmap = Bitmap.createBitmap(bitmap, 0, 0, width, height);
+                  imageReader.close();
+                  display.release();
+                  projection.stop();
+                  image.close();
+                  if (bitmap != croppedBitmap) {
+                    bitmap.recycle();
+                  }
+                  complete(croppedBitmap);
+                }
+              }, null);
+            }
+          });
     }
   }
 
@@ -402,11 +521,15 @@ public class TelescopeLayout extends FrameLayout {
     return context.checkPermission(VIBRATE, Process.myPid(), Process.myUid()) == PERMISSION_GRANTED;
   }
 
+  private static boolean sdkLevelAllowsNativeScreenshots() {
+    return Build.VERSION.SDK_INT >= LOLLIPOP;
+  }
+
   /**
    * Save a screenshot to external storage, start the done animation, and call the capture
    * listener.
    */
-  private class SaveScreenshotTask extends AsyncTask<Void, Void, File> {
+  private final class SaveScreenshotTask extends AsyncTask<Void, Void, File> {
     private final Bitmap screenshot;
 
     private SaveScreenshotTask(Bitmap screenshot) {
@@ -443,6 +566,9 @@ public class TelescopeLayout extends FrameLayout {
     }
 
     @Override protected void onPostExecute(File screenshot) {
+      if (this.screenshot != null) {
+        this.screenshot.recycle();
+      }
       saving = false;
       doneAnimator.start();
 

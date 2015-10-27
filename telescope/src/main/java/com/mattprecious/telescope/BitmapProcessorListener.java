@@ -8,10 +8,10 @@ import android.graphics.Bitmap;
  */
 public interface BitmapProcessorListener {
 
-    /**
-     * Called when the custom process of the original {@link Bitmap} finishes.
-     *
-     * @param screenshot A new {@link Bitmap} object to use and save.
-     */
-    void onBitmapReady(Bitmap screenshot);
+  /**
+   * Called when the custom process of the original {@link Bitmap} finishes.
+   *
+   * @param screenshot A new {@link Bitmap} object to use and save.
+   */
+  void onBitmapReady(Bitmap screenshot);
 }

@@ -7,4 +7,18 @@
     <attr name="screenshotChildrenOnly" format="boolean"/>
     <attr name="vibrate" format="boolean"/>
   </declare-styleable>
+  
+  <style name="TelescopeLayoutDefault">
+    <item name="pointerCount">2</item>
+    <item name="progressColor">#FF33b5e5</item>
+    <item name="screenshot">true</item>
+    <item name="screenshotChildrenOnly">false</item>
+    <item name="vibrate">true</item>
+  </style>
+
+  <public name="pointerCount" type="attr"/>
+  <public name="progressColor" type="attr"/>
+  <public name="screenshot" type="attr"/>
+  <public name="screenshotChildrenOnly" type="attr"/>
+  <public name="vibrate" type="attr"/>
 </resources>
